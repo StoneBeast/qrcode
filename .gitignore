@@ -13,3 +13,4 @@ dist/
 # 运行时数据
 history.json
 error.log
+"ui_debug.log/"  
