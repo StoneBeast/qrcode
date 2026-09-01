@@ -19,7 +19,7 @@ import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font as tkfont
 
-from PIL import Image, ImageTk, ImageDraw, ImageGrab
+from PIL import Image, ImageTk, ImageDraw, ImageGrab, ImageEnhance, ImageFont
 
 try:
     import zxingcpp
@@ -181,34 +181,56 @@ def describe_result(r):
 
 
 class SnipOverlay:
-    """全屏框选浮层：冻结屏幕截图为背景，拖拽画框，Esc/右键取消。"""
+    """全屏框选浮层（性能优化版）。
+
+    卡顿根源：Tk 的 stipple（抖动填充）矩形是纯软件逐像素合成，拖拽时在
+    全屏画布上每帧重绘必然掉帧。本实现改为：
+      * 背景一次性用 PIL 预合成"压暗版截图"（C 速度，仅一次开销）
+      * 拖拽时只更新少量持久画布元素：选区内的原始亮图（小图 crop 极快）、
+        细边框、四角手柄、尺寸标签，全部用 itemconfigure/coords 原地更新
+      * 选区面积超过阈值时不再逐帧抠亮图，只画边框，任何大小都不卡
+      * 窗口先出现（黑色 + 十字光标），背景截图随后贴上，启动体感即时
+    """
+
+    DIM = 0.45            # 选区外的压暗程度
+    BIG_AREA = 2_500_000  # 选区像素数超过此值时不逐帧抠亮图
 
     def __init__(self, master, shot, on_done, on_cancel):
-        self.shot = shot
+        self.master = master
         self.on_done = on_done
         self.on_cancel = on_cancel
         self.start = None
-        vx, vy, vw, vh = virtual_screen()
+        self.shot = shot  # 截屏必须发生在浮层可见之前，否则会抓到自己
+        self.vx, self.vy, vw, vh = virtual_screen()
+
+        # 背景先在 PIL 里合成好（压暗 + 烘焙提示文字），窗口首次绘制即为完整画面
+        dim = ImageEnhance.Brightness(shot).enhance(self.DIM)
+        self._bake_hint(dim, vw)
+        self._bg_img = ImageTk.PhotoImage(dim, master=master)
 
         self.top = tk.Toplevel(master)
         self.top.overrideredirect(True)
-        self.top.geometry(f"{vw}x{vh}+{vx}+{vy}")
+        self.top.geometry(f"{vw}x{vh}+{self.vx}+{self.vy}")
         self.top.attributes("-topmost", True)
-        self.top.configure(cursor="crosshair")
+        self.top.configure(cursor="crosshair", bg="black")
 
-        self.tkimg = ImageTk.PhotoImage(shot, master=self.top)
         self.canvas = tk.Canvas(self.top, width=vw, height=vh,
                                 highlightthickness=0, bg="black")
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.create_image(0, 0, image=self.tkimg, anchor="nw")
+        self.canvas.create_image(0, 0, image=self._bg_img, anchor="nw")
 
-        hint_w = min(vw - 20, 420)
-        self.canvas.create_rectangle((vw - hint_w) // 2, 14,
-                                     (vw + hint_w) // 2, 48,
-                                     fill="black", stipple="gray50", outline="")
-        self.canvas.create_text(vw // 2, 31, fill="white",
-                                text="拖拽框选二维码区域，Esc 或右键取消",
-                                font=(FONT_FAMILY, 11))
+        # 持久画布元素，拖拽时只改坐标/内容，不删建
+        self._img_item = self.canvas.create_image(0, 0, anchor="nw", state="hidden")
+        self._line_item = self.canvas.create_rectangle(
+            0, 0, 0, 0, outline="#00e5ff", width=2, state="hidden")
+        self._label_item = self.canvas.create_text(
+            0, 0, anchor="sw", fill="#00e5ff", font=("Consolas", 10),
+            state="hidden")
+        hs = max(3, int(4 * self.master.winfo_fpixels("1i") / 96))
+        self._hs = hs
+        self._handles = [self.canvas.create_rectangle(
+            0, 0, 0, 0, fill="#00e5ff", outline="", state="hidden")
+            for _ in range(4)]
 
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
@@ -219,40 +241,64 @@ class SnipOverlay:
         self.top.focus_force()
         self.top.grab_set()
 
+    # ---------- 背景准备 ----------
+
+    def _bake_hint(self, dim, vw):
+        """把提示文字直接烘进压暗背景里（零画布元素开销）。"""
+        try:
+            s = self.master.winfo_fpixels("1i") / 96.0
+            font = ImageFont.truetype("msyh.ttc", int(15 * s))
+            d = ImageDraw.Draw(dim)
+            text = "拖拽框选二维码区域，Esc 或右键取消"
+            w = d.textlength(text, font=font)
+            x, y = (vw - w) / 2, 20 * s
+            d.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0))
+            d.text((x, y), text, font=font, fill=(240, 240, 240))
+        except Exception:
+            pass  # 字体缺失只是没有提示文字，不影响功能
+
+    # ---------- 拖拽 ----------
+
     def _press(self, e):
         self.start = (e.x, e.y)
-        self.canvas.delete("sel")
+        for it in [self._img_item, self._line_item, self._label_item,
+                   *self._handles]:
+            self.canvas.itemconfigure(it, state="hidden")
 
     def _drag(self, e):
-        if not self.start:
+        if not self.start or self.shot is None:
             return
-        x0, y0 = self.start
-        x1, y1 = e.x, e.y
-        lx, rx = sorted((x0, x1))
-        ty, by = sorted((y0, y1))
-        vw = self.canvas.winfo_width()
-        vh = self.canvas.winfo_height()
-        self.canvas.delete("sel")
-        # 选框之外压暗
-        for box in ((0, 0, vw, ty), (0, by, vw, vh),
-                    (0, ty, lx, by), (rx, ty, vw, by)):
-            self.canvas.create_rectangle(*box, fill="black",
-                                         stipple="gray50", outline="",
-                                         tags="sel")
-        self.canvas.create_rectangle(lx, ty, rx, by, outline="#00e5ff",
-                                     width=2, tags="sel")
-        self.canvas.create_text(lx + 6, max(ty - 14, 4), anchor="w",
-                                fill="#00e5ff", font=("Consolas", 10),
-                                text=f"{rx - lx} x {by - ty}", tags="sel")
+        lx, rx = sorted((self.start[0], e.x))
+        ty, by = sorted((self.start[1], e.y))
+        if rx - lx < 2 or by - ty < 2:
+            return
+        c = self.canvas
+        # 选区内显示原始亮图（小区域 crop+转换每帧 <2ms；大区域跳过防卡顿）
+        if (rx - lx) * (by - ty) <= self.BIG_AREA:
+            self._crop_img = ImageTk.PhotoImage(
+                self.shot.crop((lx, ty, rx, by)), master=self.top)
+            c.itemconfigure(self._img_item, image=self._crop_img, state="normal")
+            c.coords(self._img_item, lx, ty)
+        else:
+            c.itemconfigure(self._img_item, state="hidden")
+        c.coords(self._line_item, lx, ty, rx - 1, by - 1)
+        c.itemconfigure(self._line_item, state="normal")
+        label_y = ty - 8 if ty > 30 else by + 8
+        c.itemconfigure(self._label_item, state="normal",
+                        text=f"{rx - lx} x {by - ty}")
+        c.coords(self._label_item, lx + 4, label_y)
+        for i, (hx, hy) in enumerate(((lx, ty), (rx, ty), (lx, by), (rx, by))):
+            c.coords(self._handles[i], hx - self._hs, hy - self._hs,
+                     hx + self._hs, hy + self._hs)
+            c.itemconfigure(self._handles[i], state="normal")
 
     def _release(self, e):
         if not self.start:
             return
         x0, y0 = self.start
-        x1, y1 = e.x, e.y
         self.start = None
-        lx, rx = sorted((x0, x1))
-        ty, by = sorted((y0, y1))
+        lx, rx = sorted((x0, e.x))
+        ty, by = sorted((y0, e.y))
         if rx - lx >= 10 and by - ty >= 10:
             crop = self.shot.crop((lx, ty, rx, by))
             self.close()
@@ -463,11 +509,11 @@ class App:
 
     def start_snip(self):
         self.root.withdraw()
-        self.root.after(200, self._do_snip)  # 等待主窗口完成隐藏
+        self.root.after(120, self._do_snip)  # 等待主窗口完成隐藏
 
     def _do_snip(self):
         try:
-            shot = grab_screen()
+            shot = grab_screen()  # 必须在浮层显示前截屏，否则会抓到浮层自己
         except Exception as e:
             self.root.deiconify()
             messagebox.showerror(APP_NAME, f"截屏失败：{e}")
