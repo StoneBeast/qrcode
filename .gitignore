@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pipcache/
+.tmp/
+
+# 构建产物（用 build.bat 一键重新生成）
+build/
+dist/
+*.spec
+
+# 运行时数据
+history.json
+error.log
