@@ -317,6 +317,99 @@ class SnipOverlay:
             cb()
 
 
+# ---------------------------------------------------------------- 现代化控件
+
+BG = "#f7f8fa"        # 应用背景
+CARD = "#ffffff"      # 卡片背景
+BORDER = "#e3e6ea"    # 边框
+TXT = "#1a1d21"       # 主文字
+TXT2 = "#6b7280"      # 次要文字
+ACCENT = "#0f9d76"    # 主题绿
+
+
+class ModernButton(tk.Canvas):
+    """扁平圆角按钮：悬停变色、按下微沉、可禁用；接口兼容 configure(state=...)。"""
+
+    STYLES = {
+        "primary": {"bg": ACCENT, "fg": "#ffffff", "hover": "#0d8d69", "active": "#0b7a5b"},
+        "blue":    {"bg": "#2b7cff", "fg": "#ffffff", "hover": "#1f6ae8", "active": "#1a5ccd"},
+        "gray":    {"bg": "#5f6368", "fg": "#ffffff", "hover": "#4a4d51", "active": "#3c4043"},
+        "soft":    {"bg": "#ffffff", "fg": "#34383d", "hover": "#f0f2f5", "active": "#e4e7ec",
+                    "border": "#d8dce2"},
+        "danger":  {"bg": "#ffffff", "fg": "#c62828", "hover": "#fdecea", "active": "#f6d3d5",
+                    "border": "#f0d6d4"},
+    }
+
+    def __init__(self, master, text, command=None, kind="soft",
+                 font_size=10, padx=14, pady=6, bold=False):
+        self._style = self.STYLES[kind]
+        f = tkfont.Font(family=FONT_FAMILY, size=font_size,
+                        weight="bold" if bold else "normal")
+        s = master.winfo_fpixels("1i") / 96.0
+        self._r = max(5, int(7 * s))
+        w = f.measure(text) + int(padx * s) * 2
+        h = f.metrics("linespace") + int(pady * s) * 2
+        super().__init__(master, width=w, height=h, bg=master["bg"],
+                         highlightthickness=0, cursor="hand2")
+        self._command = command
+        self._enabled = True
+        self._hover = False
+        self._pressed = False
+        self._rect = self.create_polygon(*self._pts(w, h), smooth=True,
+                                         width=1)
+        self._txt = self.create_text(w / 2, h / 2, text=text, font=f)
+        self._paint()
+
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _pts(self, w, h):
+        x2, y2, r = w - 1, h - 1, self._r
+        return [r, 0, x2 - r, 0, x2, 0, x2, r, x2, y2 - r, x2, y2,
+                x2 - r, y2, r, y2, 0, y2, 0, y2 - r, 0, r, 0, 0]
+
+    def _set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, "_" + k, v)
+        self._paint()
+
+    def _paint(self):
+        if not self._enabled:
+            bg, fg, border = "#ececee", "#9aa0a6", "#e0e2e6"
+        else:
+            state = "active" if self._pressed else "hover" if self._hover else "bg"
+            bg = self._style[state]
+            fg = self._style["fg"]
+            border = self._style.get("border", bg)
+        self.itemconfigure(self._rect, fill=bg, outline=border)
+        self.itemconfigure(self._txt, fill=fg)
+        self.coords(self._txt, int(self["width"]) / 2,
+                    int(self["height"]) / 2 + (1 if self._pressed else 0))
+
+    def _release(self, e):
+        was_pressed = self._pressed
+        self._set(pressed=False)
+        w, h = int(self["width"]), int(self["height"])
+        if (was_pressed and self._enabled and self._command
+                and 0 <= e.x <= w and 0 <= e.y <= h):
+            self._command()
+
+    def set_enabled(self, on):
+        self._enabled = bool(on)
+        self.configure(cursor="hand2" if self._enabled else "arrow")
+        self._paint()
+
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        if "state" in kw:
+            self.set_enabled(kw.pop("state") != "disabled")
+        if kw:
+            super().configure(**kw)
+
+
 # ---------------------------------------------------------------- 主界面
 
 
@@ -366,97 +459,108 @@ class App:
 
     def _build_ui(self):
         r = self.root
-        pad = {"padx": self._px(8), "pady": self._px(6)}
+        r.configure(bg=BG)
+        pad = {"padx": self._px(10), "pady": self._px(8)}
 
         # ---- 工具栏
-        bar = ttk.Frame(r)
+        bar = tk.Frame(r, bg=BG)
         bar.pack(fill="x", **pad)
 
-        style = ttk.Style(r)
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass
-
-        self.btn_snip = tk.Button(bar, text="📷 框选识别", command=self.start_snip,
-                                  bg="#0a8f5b", fg="white", activebackground="#0aa96d",
-                                  activeforeground="white", relief="flat",
-                                  padx=self._px(12), pady=self._px(4),
-                                  font=(FONT_FAMILY, 10, "bold"), cursor="hand2")
+        self.btn_snip = ModernButton(bar, "框选识别", self.start_snip,
+                                     kind="primary", bold=True, padx=16)
         self.btn_snip.pack(side="left")
         self._tip(self.btn_snip, "隐藏本窗口，框选屏幕任意区域识别 (Ctrl+1)")
 
-        tk.Button(bar, text="🖥 全屏识别", command=self.scan_fullscreen,
-                  relief="flat", padx=self._px(12), pady=self._px(4),
-                  font=(FONT_FAMILY, 10), cursor="hand2").pack(side="left", padx=(self._px(8), 0))
-        tk.Button(bar, text="📂 打开图片", command=self.open_file,
-                  relief="flat", padx=self._px(12), pady=self._px(4),
-                  font=(FONT_FAMILY, 10), cursor="hand2").pack(side="left", padx=(self._px(8), 0))
-        tk.Button(bar, text="📋 粘贴", command=self.paste_clipboard,
-                  relief="flat", padx=self._px(12), pady=self._px(4),
-                  font=(FONT_FAMILY, 10), cursor="hand2").pack(side="left", padx=(self._px(8), 0))
+        for text, cmd, tip in (
+                ("全屏识别", self.scan_fullscreen, "截取整个屏幕并识别 (Ctrl+2)"),
+                ("打开图片", self.open_file, "选择本地图片识别 (Ctrl+O)"),
+                ("粘贴", self.paste_clipboard, "粘贴剪贴板中的图片 (Ctrl+V)")):
+            b = ModernButton(bar, text, cmd, kind="soft")
+            b.pack(side="left", padx=(self._px(8), 0))
+            self._tip(b, tip)
 
         self.var_autocopy = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar, text="自动复制", variable=self.var_autocopy).pack(side="right")
         self.var_topmost = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="窗口置顶", variable=self.var_topmost,
-                        command=self._apply_topmost).pack(side="right", padx=(0, self._px(10)))
+        cb_kw = dict(bg=BG, fg="#44474b", activebackground=BG,
+                     activeforeground="#44474b", selectcolor="#ffffff",
+                     highlightthickness=0, font=(FONT_FAMILY, 9))
+        cb_top = tk.Checkbutton(bar, text="窗口置顶", variable=self.var_topmost,
+                                command=self._apply_topmost, **cb_kw)
+        cb_top.pack(side="right")
+        cb_auto = tk.Checkbutton(bar, text="自动复制",
+                                 variable=self.var_autocopy, **cb_kw)
+        cb_auto.pack(side="right", padx=(0, self._px(10)))
+
+        tk.Frame(r, bg=BORDER, height=1).pack(fill="x",
+                                              padx=self._px(10))
 
         # ---- 中部：预览 + 结果
-        mid = ttk.Frame(r)
+        mid = tk.Frame(r, bg=BG)
         mid.pack(fill="both", expand=True, **pad)
         mid.columnconfigure(1, weight=1)
         mid.rowconfigure(0, weight=1)
 
-        prev_frame = ttk.LabelFrame(mid, text=" 图片预览 ")
-        prev_frame.grid(row=0, column=0, sticky="nsw", padx=(0, self._px(8)))
+        prev_card = self._card(mid)
+        prev_card.grid(row=0, column=0, sticky="nsw", padx=(0, self._px(10)))
+        self._section(prev_card, "图片预览")
         self.preview_size = (self._px(340), self._px(300))
-        holder = tk.Frame(prev_frame, width=self.preview_size[0],
-                          height=self.preview_size[1], bg="#e9ebee")
-        holder.pack(padx=self._px(6), pady=self._px(6))
+        holder = tk.Frame(prev_card, width=self.preview_size[0],
+                          height=self.preview_size[1], bg="#eef0f3",
+                          highlightthickness=1, highlightbackground=BORDER)
+        holder.pack(padx=self._px(12), pady=(self._px(2), self._px(12)))
         holder.pack_propagate(False)
         self.preview = tk.Label(holder, text="框选 / 打开 / 粘贴图片\n或把图片拖进本窗口",
-                                bg="#e9ebee", fg="#777", justify="center",
+                                bg="#eef0f3", fg="#9aa0a6", justify="center",
                                 font=(FONT_FAMILY, 9))
         self.preview.pack(fill="both", expand=True)
         self.preview_img = None  # 防止 PhotoImage 被回收
 
-        res_frame = ttk.LabelFrame(mid, text=" 识别结果 ")
-        res_frame.grid(row=0, column=1, sticky="nsew")
-        res_frame.rowconfigure(1, weight=1)
-        res_frame.columnconfigure(0, weight=1)
+        res_card = self._card(mid)
+        res_card.grid(row=0, column=1, sticky="nsew")
+        self._section(res_card, "识别结果")
+        res_body = tk.Frame(res_card, bg=CARD)
+        res_body.pack(fill="both", expand=True, padx=self._px(12),
+                      pady=(self._px(2), self._px(12)))
+        res_body.rowconfigure(1, weight=1)
+        res_body.columnconfigure(0, weight=1)
 
-        self.lbl_desc = ttk.Label(res_frame, text="（暂无结果）", foreground="#555")
-        self.lbl_desc.grid(row=0, column=0, sticky="w", padx=self._px(8), pady=(self._px(4), 0))
+        self.lbl_desc = tk.Label(res_body, text="（暂无结果）", fg=TXT2,
+                                 bg=CARD, font=(FONT_FAMILY, 9), anchor="w")
+        self.lbl_desc.grid(row=0, column=0, sticky="ew", pady=(0, self._px(4)))
 
-        self.txt_result = tk.Text(res_frame, height=6, wrap="char", relief="flat",
-                                  bg="#fafafa", font=(FONT_FAMILY, 10))
-        self.txt_result.grid(row=1, column=0, sticky="nsew", padx=self._px(8), pady=self._px(4))
+        self.txt_result = tk.Text(res_body, height=6, wrap="char", relief="flat",
+                                  bg="#fbfcfd", fg=TXT, font=(FONT_FAMILY, 10),
+                                  highlightthickness=1, highlightbackground=BORDER,
+                                  padx=self._px(10), pady=self._px(8))
+        self.txt_result.grid(row=1, column=0, sticky="nsew")
         self.txt_result.configure(state="disabled")
 
-        res_btns = ttk.Frame(res_frame)
-        res_btns.grid(row=2, column=0, sticky="ew", padx=self._px(8), pady=(0, self._px(6)))
-        self.btn_copy = tk.Button(res_btns, text="复制结果", command=self.copy_result,
-                                  relief="flat", bg="#2b7cff", fg="white",
-                                  activebackground="#1e63d6", activeforeground="white",
-                                  padx=self._px(10), cursor="hand2", state="disabled")
+        res_btns = tk.Frame(res_body, bg=CARD)
+        res_btns.grid(row=2, column=0, sticky="ew", pady=(self._px(8), 0))
+        self.btn_copy = ModernButton(res_btns, "复制结果", self.copy_result,
+                                     kind="blue")
         self.btn_copy.pack(side="left")
-        self.btn_url = tk.Button(res_btns, text="打开链接", command=self.open_url,
-                                 relief="flat", bg="#5f6368", fg="white",
-                                 activebackground="#3c4043", activeforeground="white",
-                                 padx=self._px(10), cursor="hand2", state="disabled")
+        self.btn_url = ModernButton(res_btns, "打开链接", self.open_url,
+                                    kind="gray")
         self.btn_url.pack(side="left", padx=(self._px(8), 0))
 
         # ---- 历史
-        his = ttk.LabelFrame(r, text=" 历史记录（双击查看，右键操作） ")
-        his.pack(fill="x", **pad)
-        hb = ttk.Frame(his)
-        hb.pack(fill="x", padx=self._px(6), pady=(self._px(4), 0))
-        tk.Button(hb, text="清空", relief="flat", fg="#c62828",
-                  cursor="hand2", command=self.clear_history).pack(side="right")
-        self.listbox = tk.Listbox(his, height=5, activestyle="dotbox",
+        his_card = self._card(r)
+        his_card.pack(fill="x", padx=self._px(10), pady=(0, self._px(8)))
+        head = self._section(his_card, "历史记录")
+        tk.Label(head, text="双击查看 · 右键操作", bg=CARD, fg="#9aa0a6",
+                 font=(FONT_FAMILY, 8)).pack(side="left", padx=(self._px(8), 0))
+        btn_clear = ModernButton(head, "清空", self.clear_history,
+                                 kind="danger", font_size=9, padx=9, pady=3)
+        btn_clear.pack(side="right")
+        self.listbox = tk.Listbox(his_card, height=5, activestyle="none",
+                                  relief="flat", highlightthickness=0,
+                                  bg=CARD, fg="#26282b", cursor="hand2",
+                                  selectbackground="#e0f2ec",
+                                  selectforeground="#111",
                                   font=(FONT_FAMILY, 9))
-        self.listbox.pack(fill="x", padx=self._px(6), pady=(0, self._px(6)))
+        self.listbox.pack(fill="x", padx=self._px(12),
+                          pady=(self._px(2), self._px(10)))
         self.listbox.bind("<Double-Button-1>", self._on_history_dbl)
         self.listbox.bind("<Button-3>", self._on_history_menu)
         self.hist_menu = tk.Menu(self.listbox, tearoff=0)
@@ -464,9 +568,25 @@ class App:
         self.hist_menu.add_command(label="删除该条", command=self.delete_history_item)
 
         # ---- 状态栏
-        self.status = ttk.Label(r, text="就绪", relief="sunken", anchor="w",
-                                padding=(self._px(6), self._px(2)))
+        self.status = tk.Label(r, text="就绪", bg="#eef0f3", fg="#5f6368",
+                               anchor="w", font=(FONT_FAMILY, 9),
+                               padx=self._px(10), pady=self._px(4))
         self.status.pack(fill="x", side="bottom")
+
+    def _card(self, parent):
+        return tk.Frame(parent, bg=CARD, highlightthickness=1,
+                        highlightbackground=BORDER)
+
+    def _section(self, card, title):
+        """卡片标题：主题色小竖条 + 加粗文字，返回标题行容器便于扩展。"""
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill="x", padx=self._px(12), pady=(self._px(10), self._px(4)))
+        tk.Frame(head, bg=ACCENT, width=self._px(3),
+                 height=self._px(14)).pack(side="left")
+        tk.Label(head, text=title, bg=CARD, fg=TXT,
+                 font=(FONT_FAMILY, 10, "bold")).pack(side="left",
+                                                      padx=(self._px(7), 0))
+        return head
 
     def _tip(self, widget, text):
         """轻量 tooltip。"""
@@ -478,16 +598,17 @@ class App:
             x = widget.winfo_rootx() + 10
             y = widget.winfo_rooty() + widget.winfo_height() + 4
             tw.wm_geometry(f"+{x}+{y}")
-            tk.Label(tw, text=text, bg="#333", fg="white", justify="left",
-                     font=(FONT_FAMILY, 9), padx=6, pady=3).pack()
+            tk.Label(tw, text=text, bg="#2b2f33", fg="white", justify="left",
+                     font=(FONT_FAMILY, 9), padx=8, pady=4).pack()
 
         def leave(_):
             if tip["win"]:
                 tip["win"].destroy()
                 tip["win"] = None
 
-        widget.bind("<Enter>", enter)
-        widget.bind("<Leave>", leave)
+        # add="+" 避免覆盖 ModernButton 自身的悬停绑定
+        widget.bind("<Enter>", enter, add="+")
+        widget.bind("<Leave>", leave, add="+")
 
     def _bind_keys(self):
         r = self.root
