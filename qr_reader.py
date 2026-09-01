@@ -13,11 +13,14 @@ import re
 import sys
 import json
 import time
+import queue
 import ctypes
+import threading
 import traceback
 import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font as tkfont
+from ctypes import wintypes
 
 from PIL import Image, ImageTk, ImageDraw, ImageGrab, ImageEnhance, ImageFont
 
@@ -347,8 +350,11 @@ class ModernButton(tk.Canvas):
                         weight="bold" if bold else "normal")
         s = master.winfo_fpixels("1i") / 96.0
         self._r = max(5, int(7 * s))
-        w = f.measure(text) + int(padx * s) * 2
-        h = f.metrics("linespace") + int(pady * s) * 2
+        self._font = f
+        self._padx_s = int(padx * s)
+        self._pady_s = int(pady * s)
+        w = f.measure(text) + self._padx_s * 2
+        h = f.metrics("linespace") + self._pady_s * 2
         super().__init__(master, width=w, height=h, bg=master["bg"],
                          highlightthickness=0, cursor="hand2")
         self._command = command
@@ -409,6 +415,296 @@ class ModernButton(tk.Canvas):
         if kw:
             super().configure(**kw)
 
+    def set_text(self, text):
+        """就地更新按钮文字并自适应宽度（快捷键录入等动态文本场景）。"""
+        self._text = text
+        w = self._font.measure(text) + self._padx_s * 2
+        h = self._font.metrics("linespace") + self._pady_s * 2
+        self.configure(width=w, height=h)
+        self.coords(self._txt, w / 2, h / 2 + (1 if self._pressed else 0))
+        self.itemconfigure(self._txt, text=text)
+        self._paint()
+
+
+# ---------------------------------------------------------------- 全局快捷键
+
+WM_HOTKEY = 0x0312
+WM_APP_WAKE = 0x8000 + 1          # 自定义命令唤醒消息
+MOD_ALT, MOD_CONTROL, MOD_SHIFT = 0x1, 0x2, 0x4
+MOD_NOREPEAT = 0x4000
+
+
+class _MSG(ctypes.Structure):
+    _fields_ = [("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                ("time", wintypes.DWORD), ("pt", wintypes.POINT)]
+
+
+class GlobalHotkeys:
+    """系统级快捷键（RegisterHotKey）。
+
+    独立线程跑消息循环；注册/注销通过命令队列发到该线程执行，
+    触发事件经 queue 交给 UI 线程轮询分发——无论焦点在哪都可触发。
+    """
+
+    def __init__(self):
+        self.triggered = queue.Queue()   # 触发的热键 id
+        self.status = {}                 # id -> 注册是否成功
+        self._cmd = queue.Queue()
+        self._cur = {}
+        self._tid = 0
+        self._ready = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        self._ready.wait(2)
+
+    def _run(self):
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        self._tid = k.GetCurrentThreadId()
+        msg = _MSG()
+        # 先强制创建消息队列：PostThreadMessage 发往未建队的线程会静默丢消息
+        u.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        self._ready.set()
+        while True:
+            r = u.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r <= 0:
+                break
+            if msg.message == WM_HOTKEY:
+                self.triggered.put(int(msg.wParam) & 0xFFFF)
+            elif msg.message == WM_APP_WAKE:
+                self._apply_pending(u)
+
+    def _apply_pending(self, u):
+        while True:
+            try:
+                _, mapping = self._cmd.get_nowait()
+            except queue.Empty:
+                return
+            for hid in list(self._cur):
+                u.UnregisterHotKey(None, hid)
+            self._cur.clear()
+            self.status.clear()
+            for hid, (mods, vk) in mapping.items():
+                ok = bool(u.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk))
+                self.status[hid] = ok
+                if ok:
+                    self._cur[hid] = (mods, vk)
+
+    def apply(self, mapping):
+        """让线程按 mapping 全量重建注册；唤醒消息投递失败时自动重试。"""
+        self._cmd.put(("apply", dict(mapping)))
+        u = ctypes.windll.user32
+        for _ in range(50):
+            if self._tid and u.PostThreadMessageW(self._tid, WM_APP_WAKE, 0, 0):
+                return True
+            time.sleep(0.02)
+        return False
+
+
+HOTKEY_IDS = {"snip": 1, "fs": 2, "open": 3, "paste": 4}
+DEFAULT_HOTKEYS = {
+    "snip": (MOD_CONTROL, ord("Q"), "Ctrl+Alt+Q"),
+    "fs": (MOD_CONTROL, ord("W"), "Ctrl+Alt+W"),
+    "open": (MOD_CONTROL, ord("O"), "Ctrl+Alt+O"),
+    "paste": (MOD_CONTROL, ord("V"), "Ctrl+Alt+V"),
+}
+HOTKEY_FILE = os.path.join(data_dir(), "settings.json")
+
+# 全局热键不能用无修饰的单键（会抢掉全系统的按键），F 功能键除外
+_HOTKEY_MODIFIER_KEYS = {"Shift_L", "Shift_R", "Control_L", "Control_R",
+                         "Alt_L", "Alt_R", "Meta_L", "Meta_R"}
+
+
+def friendly_keysym(ks):
+    if len(ks) == 1:
+        return ks.upper()
+    return {"space": "Space", "Prior": "PgUp", "Next": "PgDn",
+            "Return": "Enter", "Delete": "Del", "Insert": "Ins",
+            "Left": "←", "Right": "→", "Up": "↑", "Down": "↓",
+            "Escape": "Esc"}.get(ks, ks)
+
+
+def load_hotkey_config():
+    cfg = {k: tuple(v) for k, v in DEFAULT_HOTKEYS.items()}
+    try:
+        with open(HOTKEY_FILE, "r", encoding="utf-8") as f:
+            hk = json.load(f).get("hotkeys", {})
+        for k in DEFAULT_HOTKEYS:
+            v = hk.get(k)
+            if isinstance(v, list) and len(v) == 3:
+                cfg[k] = (int(v[0]), int(v[1]), str(v[2]))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_hotkey_config(cfg):
+    try:
+        with open(HOTKEY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"hotkeys": {k: list(v) for k, v in cfg.items()}},
+                      f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+class HotkeyRecorder(ModernButton):
+    """快捷键录制按钮：点击后按下新组合键，Esc 取消，失焦自动结束。"""
+
+    def __init__(self, master, value):
+        self.value = value  # (mods, vk, label)
+        self.recording = False
+        super().__init__(master, value[2] if value else "未设置",
+                         command=self._start_recording, kind="soft",
+                         font_size=9, padx=12, pady=4)
+
+    def _start_recording(self):
+        if self.recording:
+            return
+        self.recording = True
+        self.set_text("按下新快捷键… (Esc 取消)")
+        self.focus_set()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+        self.bind("<KeyPress>", self._on_key, add="+")
+        self.bind("<FocusOut>", self._stop_recording, add="+")
+
+    def _stop_recording(self, _e=None):
+        self.recording = False
+        try:
+            self.unbind("<KeyPress>")
+            self.unbind("<FocusOut>")
+        except Exception:
+            pass
+        self.set_text(self.value[2] if self.value else "未设置")
+
+    def _on_key(self, e):
+        if not self.recording:
+            return "break"
+        if e.keysym == "Escape":
+            self._stop_recording()
+            return "break"
+        mods = 0
+        parts = []
+        if e.state & 0x4:
+            mods |= MOD_CONTROL
+            parts.append("Ctrl")
+        if e.state & 0x1:
+            mods |= MOD_SHIFT
+            parts.append("Shift")
+        if e.state & 0x8:
+            mods |= MOD_ALT
+            parts.append("Alt")
+        if e.keysym in _HOTKEY_MODIFIER_KEYS:
+            self.set_text(("+".join(parts) + "+…") if parts
+                          else "按下组合键… (Esc 取消)")
+            return "break"
+        if mods == 0 and not (e.keysym.startswith("F")
+                              and e.keysym[1:].isdigit()):
+            self.set_text("需加 Ctrl/Alt/Shift 或用 F 功能键")
+            return "break"
+        self.value = (mods, e.keycode,
+                      "+".join(parts + [friendly_keysym(e.keysym)]))
+        self._stop_recording()
+        return "break"
+
+
+class SettingsDialog:
+    """全局快捷键设置。打开时注销全部热键避免系统抢键，关闭时恢复/应用。"""
+
+    ACTIONS = [("snip", "框选识别"), ("fs", "全屏识别"),
+               ("open", "打开图片"), ("paste", "粘贴识别")]
+
+    def __init__(self, app):
+        self.app = app
+        self.top = tk.Toplevel(app.root)
+        self.top.title("设置 · 全局快捷键")
+        self.top.configure(bg=BG)
+        self.top.transient(app.root)
+        self.top.resizable(False, False)
+        self.top.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        self._old = dict(app.hotkey_cfg)
+        app.hotkeys.apply({})  # 录入期间先注销，防止已注册热键抢占按键
+
+        tk.Label(self.top, justify="left", bg=BG, fg=TXT2,
+                 text="无论当前焦点在哪个程序，按下快捷键即可触发识别。\n"
+                      "点击按钮后直接按新组合键（需含 Ctrl/Alt/Shift，或用 F 功能键），Esc 取消。",
+                 font=(FONT_FAMILY, 9)).pack(anchor="w", padx=14,
+                                             pady=(12, 8))
+
+        self.recorders = {}
+        for name, label in self.ACTIONS:
+            row = tk.Frame(self.top, bg=BG)
+            row.pack(fill="x", padx=14, pady=3)
+            tk.Label(row, text=label, width=10, anchor="w", bg=BG,
+                     fg=TXT, font=(FONT_FAMILY, 10)).pack(side="left")
+            rec = HotkeyRecorder(row, app.hotkey_cfg.get(name))
+            rec.pack(side="left", padx=(self._px_of(app), 0))
+            self.recorders[name] = rec
+
+        self.hint = tk.Label(self.top, text="", bg=BG, fg="#c62828",
+                             font=(FONT_FAMILY, 9), anchor="w")
+        self.hint.pack(fill="x", padx=14, pady=(4, 0))
+
+        btns = tk.Frame(self.top, bg=BG)
+        btns.pack(fill="x", padx=14, pady=(8, 12))
+        ModernButton(btns, "恢复默认", self._defaults,
+                     kind="soft", font_size=9).pack(side="left")
+        ModernButton(btns, "保存", self.save, kind="primary",
+                     font_size=9).pack(side="right")
+        ModernButton(btns, "取消", self.cancel, kind="soft",
+                     font_size=9).pack(side="right", padx=(0, 8))
+
+        self.top.update_idletasks()
+        w, h = self.top.winfo_width(), self.top.winfo_height()
+        px = app.root.winfo_rootx() + (app.root.winfo_width() - w) // 2
+        py = app.root.winfo_rooty() + (app.root.winfo_height() - h) // 3
+        self.top.geometry(f"+{px}+{py}")
+        self.top.grab_set()
+        self.top.focus_set()
+
+    @staticmethod
+    def _px_of(app):
+        return app._px(8)
+
+    def _defaults(self):
+        for name, rec in self.recorders.items():
+            rec.value = tuple(DEFAULT_HOTKEYS[name])
+            rec.set_text(rec.value[2])
+        self.hint.configure(text="")
+
+    def cancel(self):
+        self.app.hotkeys.apply(self.app._numeric_mapping(self._old))
+        self.top.destroy()
+
+    def save(self):
+        values = {}
+        for name, rec in self.recorders.items():
+            if not rec.value or rec.value[2] == "未设置":
+                messagebox.showwarning(APP_NAME, "请为「%s」设置快捷键"
+                                       % dict(self.ACTIONS)[name],
+                                       parent=self.top)
+                return
+            values[name] = tuple(rec.value)
+        seen = {}
+        for name, (mods, vk, label) in values.items():
+            if (mods, vk) in seen:
+                messagebox.showwarning(
+                    APP_NAME,
+                    "快捷键 %s 同时分配给了「%s」和「%s」，请更换"
+                    % (label, dict(self.ACTIONS)[seen[(mods, vk)]],
+                       dict(self.ACTIONS)[name]), parent=self.top)
+                return
+            seen[(mods, vk)] = name
+        self.app.hotkey_cfg = values
+        save_hotkey_config(values)
+        self.app.hotkeys.apply(self.app._numeric_mapping(values))
+        self.top.destroy()
+        self.app.root.after(400, self.app._refresh_hotkey_status)
+
 
 # ---------------------------------------------------------------- 主界面
 
@@ -418,11 +714,12 @@ class App:
         self.root = root
         self.current_results = []
         self.history = self._load_history()
+        self._snipping = False
 
         self._setup_fonts()
         self.s = root.winfo_fpixels("1i") / 96.0  # DPI 缩放系数
         self._build_ui()
-        self._bind_keys()
+        self._setup_hotkeys()
         self._render_history()
 
         root.title(f"{APP_NAME} QReader v{APP_VERSION}")
@@ -484,6 +781,9 @@ class App:
         cb_kw = dict(bg=BG, fg="#44474b", activebackground=BG,
                      activeforeground="#44474b", selectcolor="#ffffff",
                      highlightthickness=0, font=(FONT_FAMILY, 9))
+        btn_settings = ModernButton(bar, "设置", self.open_settings, kind="soft")
+        btn_settings.pack(side="right", padx=(self._px(8), 0))
+        self._tip(btn_settings, "自定义全局快捷键")
         cb_top = tk.Checkbutton(bar, text="窗口置顶", variable=self.var_topmost,
                                 command=self._apply_topmost, **cb_kw)
         cb_top.pack(side="right")
@@ -610,14 +910,104 @@ class App:
         widget.bind("<Enter>", enter, add="+")
         widget.bind("<Leave>", leave, add="+")
 
-    def _bind_keys(self):
-        r = self.root
-        # 注意：Tk 里 <Control-1> 是 Ctrl+鼠标左键，数字键必须用 <Control-Key-N>
-        r.bind("<Control-Key-1>", lambda e: self.start_snip())
-        r.bind("<Control-Key-2>", lambda e: self.scan_fullscreen())
-        r.bind("<Control-o>", lambda e: self.open_file())
-        r.bind("<Control-v>", lambda e: self.paste_clipboard())
-        r.bind("<Control-c>", lambda e: self.copy_result() if self.current_results else None)
+    # ---------- 全局快捷键 ----------
+
+    def _setup_hotkeys(self):
+        self.hotkey_cfg = load_hotkey_config()
+        self.hotkeys = GlobalHotkeys()
+        self._fallback_seqs = []
+        self.root.after(80, self._poll_hotkeys)
+        self.hotkeys.apply(self._numeric_mapping(self.hotkey_cfg))
+        self.root.after(400, self._refresh_hotkey_status)
+
+    def _numeric_mapping(self, cfg):
+        return {HOTKEY_IDS[k]: (v[0], v[1])
+                for k, v in cfg.items() if k in HOTKEY_IDS}
+
+    def _poll_hotkeys(self):
+        """UI 线程轮询热键线程的触发队列并分发（约 80ms 延迟，无感知）。"""
+        actions = {"snip": self.start_snip, "fs": self.scan_fullscreen,
+                   "open": self.open_file, "paste": self.paste_clipboard}
+        try:
+            while True:
+                hid = self.hotkeys.triggered.get_nowait()
+                for name, i in HOTKEY_IDS.items():
+                    if i == hid and name in actions:
+                        try:
+                            actions[name]()
+                        except Exception:
+                            traceback.print_exc()
+        except queue.Empty:
+            pass
+        self.root.after(80, self._poll_hotkeys)
+
+    def _refresh_hotkey_status(self):
+        self._clear_hotkey_fallbacks()
+        failed = [n for n, i in HOTKEY_IDS.items()
+                  if self.hotkeys.status.get(i) is False]
+        if not failed:
+            snip_label = self.hotkey_cfg.get("snip", ("", "", "?"))[2]
+            self.set_status(f"就绪 · 全局快捷键已启用（{snip_label} 框选识别，"
+                            "右下角「设置」可自定义）")
+            return
+        labels = "、".join(self.hotkey_cfg[n][2] for n in failed
+                          if n in self.hotkey_cfg)
+        self.set_status(f"⚠ 快捷键注册失败（可能被其他软件占用）：{labels}"
+                        "——焦点在本窗口时仍可用，或到「设置」更换")
+        # 注册失败的键退回窗口内绑定，保证有焦点时可用
+        for n in failed:
+            value = self.hotkey_cfg.get(n)
+            seq = self._tk_seq_from_value(value) if value else None
+            if seq:
+                try:
+                    self.root.bind(seq, lambda e, a=n: self._dispatch_hotkey(a))
+                    self._fallback_seqs.append(seq)
+                except Exception:
+                    pass
+
+    def _dispatch_hotkey(self, name):
+        actions = {"snip": self.start_snip, "fs": self.scan_fullscreen,
+                   "open": self.open_file, "paste": self.paste_clipboard}
+        actions.get(name, lambda: None)()
+
+    def _clear_hotkey_fallbacks(self):
+        for seq in self._fallback_seqs:
+            try:
+                self.root.unbind(seq)
+            except Exception:
+                pass
+        self._fallback_seqs = []
+
+    @staticmethod
+    def _tk_seq_from_value(value):
+        mods, vk, _ = value
+        parts = []
+        if mods & MOD_CONTROL:
+            parts.append("Control")
+        if mods & MOD_ALT:
+            parts.append("Alt")
+        if mods & MOD_SHIFT:
+            parts.append("Shift")
+        if 0x41 <= vk <= 0x5A:
+            key = chr(vk).lower()
+        elif 0x30 <= vk <= 0x39:
+            key = chr(vk)
+        elif 0x70 <= vk <= 0x87:
+            key = "F%d" % (vk - 0x70 + 1)
+        else:
+            return None
+        return "<" + "-".join(parts + [key]) + ">"
+
+    def open_settings(self):
+        if getattr(self, "_settings_open", False):
+            return
+        self._settings_open = True
+
+        def on_done():
+            self._settings_open = False
+
+        dlg = SettingsDialog(self)
+        dlg.top.bind("<Destroy>", lambda e: on_done(), add="+")
 
     def _apply_topmost(self):
         self.root.attributes("-topmost", self.var_topmost.get())
@@ -629,6 +1019,9 @@ class App:
     # ---------- 识别入口 ----------
 
     def start_snip(self):
+        if self._snipping:
+            return
+        self._snipping = True
         self.root.withdraw()
         self.root.after(120, self._do_snip)  # 等待主窗口完成隐藏
 
@@ -636,6 +1029,7 @@ class App:
         try:
             shot = grab_screen()  # 必须在浮层显示前截屏，否则会抓到浮层自己
         except Exception as e:
+            self._snipping = False
             self.root.deiconify()
             messagebox.showerror(APP_NAME, f"截屏失败：{e}")
             return
@@ -651,6 +1045,7 @@ class App:
         self.process_image(crop, source="屏幕框选")
 
     def _restore_main(self):
+        self._snipping = False
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
