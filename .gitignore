@@ -5,10 +5,13 @@ __pycache__/
 .pipcache/
 .tmp/
 
-# 构建产物（用 build.bat 一键重新生成）
+# 构建产物
 build/
 dist/
 *.spec
+
+# 本地构建脚本（含本机路径，不入库；打包方法见 README）
+build.bat
 
 # 运行时数据
 history.json

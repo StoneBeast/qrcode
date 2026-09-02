@@ -21,11 +21,11 @@
 
 ## 使用
 
-**免安装直接用**：双击 `dist\QReader.exe`（约 19MB，单文件，无需 Python 环境）。
+按下面「打包」一节生成 `dist\QReader.exe`（约 19MB，单文件），双击即可运行，无需 Python 环境。
 
 推荐工作流：`Win+Shift+S` 截屏 → 切到 QReader 按 `Ctrl+V`，或直接点「框选识别」。
 
-**开发模式运行**：`run.bat`（使用本目录 `.venv` 里的环境）。
+**开发模式运行**：先按「打包」一节创建好虚拟环境并安装依赖，然后运行 `run.bat`。
 
 命令行也支持直接传图片：`QReader.exe 图片路径`，启动即识别。
 
@@ -37,22 +37,27 @@ qrcode/
 ├── make_icon.py      # 生成应用图标 app.ico
 ├── make_test_qr.py   # 生成 test_data/ 测试二维码
 ├── test_decode.py    # 解码自测脚本
-├── build.bat         # 一键构建（自动建环境→装依赖→打包）
 ├── run.bat           # 开发模式运行
-├── dist/QReader.exe  # 构建产物（可直接分发）
-└── .venv/            # Python 虚拟环境（在本目录，不占 C 盘）
+├── app.ico           # 应用图标
+└── test_data/        # 测试二维码图片
 ```
 
-## 构建
+## 打包
+
+运行依赖只有 3 个第三方库：`zxing-cpp`（扫码核心）、`Pillow`（图片解码/截屏）、`tkinterdnd2`（窗口拖拽支持）。GUI 用系统自带 tkinter，刻意不引入 OpenCV / Qt，体积才压得下来。
+
+以 Windows + Python 3.10+ 为例：
 
 ```bat
-build.bat
+:: 1. 创建虚拟环境并安装依赖（含打包工具 PyInstaller）
+python -m venv .venv
+.venv\Scripts\python -m pip install zxing-cpp pillow tkinterdnd2 pyinstaller
+
+:: 2. 打包单文件 exe
+.venv\Scripts\python -m PyInstaller --noconfirm --clean --onefile --windowed --icon app.ico --name QReader qr_reader.py
 ```
 
-环境说明：
-
-- Python 使用 `D:\huggingFace\pythons` 下已有的 3.12.14 创建 venv，虚拟环境、pip 缓存、打包临时目录全部位于本目录。
-- 运行时依赖仅 3 个：`zxing-cpp`（约 1.5MB，扫码核心）、`Pillow`（图片解码/截屏）、`tkinterdnd2`（拖拽支持，约 0.5MB）。GUI 用系统自带 tkinter，刻意不引入 OpenCV / Qt，体积才压得下来。
+构建完成后得到 `dist\QReader.exe`，单文件、免安装、可直接分发。图标 `app.ico` 已随仓库提供，如需重新生成可运行 `make_icon.py`。
 
 ## 自测
 

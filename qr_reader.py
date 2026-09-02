@@ -27,7 +27,7 @@ from PIL import Image, ImageTk, ImageDraw, ImageGrab, ImageEnhance, ImageFont
 try:
     import zxingcpp
 except ImportError:
-    print("缺少 zxing-cpp：请在 .venv 中执行 pip install zxing-cpp")
+    print("缺少 zxing-cpp：请先执行 pip install zxing-cpp")
     raise
 
 APP_NAME = "二维码识别工具"
