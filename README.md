@@ -59,6 +59,17 @@ python -m venv .venv
 
 构建完成后得到 `dist\QReader.exe`，单文件、免安装、可直接分发。图标 `app.ico` 已随仓库提供，如需重新生成可运行 `make_icon.py`。
 
+## 自动发布
+
+仓库配置了 GitHub Actions（`.github/workflows/release.yml`）：推送 `v*` 标签即自动打包并发布 Release，附上 `QReader-<版本>.exe`（版本号取自源码里的 `APP_VERSION`）：
+
+```bash
+git tag v1.0.0
+git push origin main --tags
+```
+
+也可以在仓库的 Actions 页面手动触发（Run workflow），构建产物从该次运行的 Artifacts 下载，不发布 Release。
+
 ## 自测
 
 ```bat
