@@ -12,6 +12,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # runner 控制台默认 cp1252，强制 UTF-8 以便打印中文解码结果
+      PYTHONUTF8: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
